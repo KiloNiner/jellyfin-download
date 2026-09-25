@@ -9,6 +9,7 @@ A single-file Python script that downloads series and movies from a Jellyfin ser
 - Shows what's available for a series: seasons, episodes, runtimes and file sizes
 - Uses the original filename from the server when it provides one, otherwise names files `Series - S01E02 - Title.ext` or `Title (Year).ext`
 - Skips files that are already complete and resumes partial downloads, so an interrupted run can be restarted safely
+- Shows progress as a TIE fighter chasing an X-wing across a scrolling starfield, with size, speed and ETA (set `NO_COLOR` to disable colours)
 - Skips "missing" placeholder episodes that Jellyfin lists but doesn't have a file for
 - Can read the API key from 1Password via the `op` CLI instead of storing it anywhere
 

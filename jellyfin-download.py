@@ -38,6 +38,7 @@ import json
 import math
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -251,28 +252,84 @@ def remote_size(resp):
 
 
 class Progress:
+    """Progress line where a TIE fighter chases an X-wing across a scrolling
+    starfield. The X-wing's position along the track is the download progress;
+    when the download completes the TIE fighter explodes."""
+
+    TIE, XWING, BOOM = "(-o-)", "X=>", " *#* "
+    GAP = 7  # laser corridor between the two ships
+    STATS_WIDTH = 52  # room for "100.0%  999.9 MB / 999.9 GB  999.9 MB/s  ETA 9:59:59"
+    FRAME_INTERVAL = 0.1
+
     def __init__(self, total, done):
         self.total, self.done, self.start_done = total, done, done
         self.start = self.last = time.monotonic()
+        self.frame = 0
         self.enabled = sys.stderr.isatty()
+        color = self.enabled and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
+        codes = {"star": "2", "tie": "37", "laser": "92", "xwing": "1;97",
+                 "engine": "91", "boom": "1;93"}
+        self.style = {k: f"\033[{v}m" if color else "" for k, v in codes.items()}
+        self.reset = "\033[0m" if color else ""
 
     def update(self, n):
         self.done += n
         now = time.monotonic()
-        if self.enabled and now - self.last >= 0.5:
+        if self.enabled and now - self.last >= self.FRAME_INTERVAL:
             self.last = now
+            self.frame += 1
             self.draw(now)
 
-    def draw(self, now):
+    def stats(self, now):
         rate = (self.done - self.start_done) / max(now - self.start, 1e-6)
-        pct = f"{self.done / self.total:6.1%} " if self.total else ""
-        total = f" / {human_size(self.total)}" if self.total else ""
-        print(f"\r  {pct}{human_size(self.done)}{total}  {human_size(rate)}/s   ",
-              end="", file=sys.stderr, flush=True)
+        parts = [human_size(self.done)]
+        if self.total:
+            parts = [f"{self.done / self.total:6.1%}", f"{human_size(self.done)} / {human_size(self.total)}"]
+        parts.append(f"{human_size(rate)}/s")
+        if self.total and rate > 0 and self.done < self.total:
+            eta = int((self.total - self.done) / rate)
+            parts.append(f"ETA {eta // 3600}:{eta // 60 % 60:02d}:{eta % 60:02d}" if eta >= 3600
+                         else f"ETA {eta // 60}:{eta % 60:02d}")
+        return "  ".join(parts)
+
+    def track(self, width, finished):
+        # Stars drift left as the ships fly right.
+        cells = [(" ", "")] * width
+        for i in range(width):
+            j = i + self.frame // 2
+            if j % 11 == 0 or j % 17 == 5:
+                cells[i] = ("\u00b7", "star")
+
+        if self.total:
+            head = round(min(self.done / self.total, 1) * (width - len(self.XWING)))
+        else:
+            head = width * 2 // 3
+        if finished:
+            tie, lasers = [(c, "boom") for c in self.BOOM], [(" ", "")] * self.GAP
+        else:
+            tie = [(c, "tie") for c in self.TIE]
+            # Bolts travel right, one cell per frame.
+            lasers = [("-", "laser") if (i - self.frame) % 3 == 0 else (" ", "")
+                      for i in range(self.GAP)]
+        ships = tie + lasers + [("X", "xwing"), ("=", "engine"), (">", "engine")]
+
+        first = head - len(tie) - self.GAP
+        for k, cell in enumerate(ships):
+            if 0 <= first + k < width:
+                cells[first + k] = cell
+        return "".join(f"{self.style[st]}{ch}{self.reset}" if st else ch for ch, st in cells)
+
+    def draw(self, now, finished=False):
+        stats = self.stats(now)
+        columns = shutil.get_terminal_size((80, 24)).columns
+        # Fixed per terminal size, so the ships don't jump as the stats change.
+        width = min(48, columns - self.STATS_WIDTH - 7)
+        line = f"  [{self.track(width, finished)}]  {stats}" if width >= 20 else f"  {stats}"
+        print(f"\r{line}\033[K", end="", file=sys.stderr, flush=True)
 
     def finish(self):
         if self.enabled:
-            self.draw(time.monotonic())
+            self.draw(time.monotonic(), finished=True)
             print(file=sys.stderr)
 
 
