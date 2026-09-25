@@ -37,6 +37,7 @@ import argparse
 import json
 import math
 import os
+import random
 import re
 import shutil
 import socket
@@ -253,11 +254,14 @@ def remote_size(resp):
 
 class Progress:
     """Progress line where a TIE fighter chases an X-wing across a scrolling
-    starfield. The X-wing's position along the track is the download progress;
-    when the download completes the TIE fighter explodes."""
+    starfield. The X-wing's position along the track is the download progress.
+    Every few seconds the X-wing flips around and fires back; when the download
+    completes the TIE fighter explodes."""
 
-    TIE, XWING, BOOM = "(-o-)", "X=>", " *#* "
+    TIE, TIE_HIT, XWING, BOOM = "(-o-)", "(*o*)", "X=>", " *#* "
     GAP = 7  # laser corridor between the two ships
+    VOLLEY_FRAMES = 9  # flip, fire back, hit, flip again
+    VOLLEY_GAP = (25, 60)  # frames between volleys
     STATS_WIDTH = 52  # room for "100.0%  999.9 MB / 999.9 GB  999.9 MB/s  ETA 9:59:59"
     FRAME_INTERVAL = 0.1
 
@@ -265,10 +269,12 @@ class Progress:
         self.total, self.done, self.start_done = total, done, done
         self.start = self.last = time.monotonic()
         self.frame = 0
+        self.rng = random.Random()
+        self.next_volley = self.rng.randint(*self.VOLLEY_GAP)
         self.enabled = sys.stderr.isatty()
         color = self.enabled and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
         codes = {"star": "2", "tie": "37", "laser": "92", "xwing": "1;97",
-                 "engine": "91", "boom": "1;93"}
+                 "engine": "91", "xlaser": "1;91", "boom": "1;93"}
         self.style = {k: f"\033[{v}m" if color else "" for k, v in codes.items()}
         self.reset = "\033[0m" if color else ""
 
@@ -278,6 +284,8 @@ class Progress:
         if self.enabled and now - self.last >= self.FRAME_INTERVAL:
             self.last = now
             self.frame += 1
+            if self.frame >= self.next_volley + self.VOLLEY_FRAMES:
+                self.next_volley = self.frame + self.rng.randint(*self.VOLLEY_GAP)
             self.draw(now)
 
     def stats(self, now):
@@ -304,14 +312,25 @@ class Progress:
             head = round(min(self.done / self.total, 1) * (width - len(self.XWING)))
         else:
             head = width * 2 // 3
+        tie = [(c, "tie") for c in self.TIE]
+        xwing = [("X", "xwing"), ("=", "engine"), (">", "engine")]
+        volley = self.frame - self.next_volley
         if finished:
             tie, lasers = [(c, "boom") for c in self.BOOM], [(" ", "")] * self.GAP
+        elif 0 <= volley < self.VOLLEY_FRAMES:
+            # The X-wing flips around; its red bolts travel left, and the
+            # TIE fighter flashes when they arrive.
+            if volley < self.VOLLEY_FRAMES - 1:
+                xwing = [(c, "xwing") for c in "<=X"]
+            if volley in (5, 6):
+                tie = [(c, "boom") for c in self.TIE_HIT]
+            lasers = [("-", "xlaser") if 1 <= volley <= 5 and (i + volley) % 3 == 0 else (" ", "")
+                      for i in range(self.GAP)]
         else:
-            tie = [(c, "tie") for c in self.TIE]
             # Bolts travel right, one cell per frame.
             lasers = [("-", "laser") if (i - self.frame) % 3 == 0 else (" ", "")
                       for i in range(self.GAP)]
-        ships = tie + lasers + [("X", "xwing"), ("=", "engine"), (">", "engine")]
+        ships = tie + lasers + xwing
 
         first = head - len(tie) - self.GAP
         for k, cell in enumerate(ships):
