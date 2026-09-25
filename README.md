@@ -1,6 +1,6 @@
 # jellyfin-download
 
-A Bash script that downloads series and movies from a Jellyfin server, with episode ranges, resumable downloads, and a quick overview of what the server has.
+A single-file Python script that downloads series and movies from a Jellyfin server, with episode ranges, resumable downloads, and a quick overview of what the server has.
 
 ## What it does
 
@@ -14,8 +14,7 @@ A Bash script that downloads series and movies from a Jellyfin server, with epis
 
 ## Requirements
 
-- Bash 4.4+
-- `curl` and `python3` (standard library only)
+- Python 3.9+ (standard library only, nothing to `pip install`)
 - A Jellyfin API key (Dashboard → API Keys)
 - Optional: the [1Password CLI](https://developer.1password.com/docs/cli/) (`op`) if the key lives in 1Password
 
@@ -42,16 +41,16 @@ JELLYFIN_OP_VAULT=Private
 ## Usage
 
 ```bash
-./jellyfin-download.sh list series                  # everything
-./jellyfin-download.sh list movies zombie           # filtered by name
+./jellyfin-download.py list series                  # everything
+./jellyfin-download.py list movies zombie           # filtered by name
 
-./jellyfin-download.sh info "Zombie Land Saga"      # seasons, episodes, sizes
-./jellyfin-download.sh info -r s2 "Zombie Land Saga"  # preview a range
+./jellyfin-download.py info "Zombie Land Saga"      # seasons, episodes, sizes
+./jellyfin-download.py info -r s2 "Zombie Land Saga"  # preview a range
 
-./jellyfin-download.sh "Zombie Land Saga"                      # whole series into ./Zombie Land Saga/
-./jellyfin-download.sh -r s1e1-s2e8 "Zombie Land Saga" ~/TV    # a range, into ~/TV
-./jellyfin-download.sh -t movie "Zombieland" ~/Movies          # a movie
-./jellyfin-download.sh --help
+./jellyfin-download.py "Zombie Land Saga"                      # whole series into ./Zombie Land Saga/
+./jellyfin-download.py -r s1e1-s2e8 "Zombie Land Saga" ~/TV    # a range, into ~/TV
+./jellyfin-download.py -t movie "Zombieland" ~/Movies          # a movie
+./jellyfin-download.py --help
 ```
 
 ### Ranges
@@ -73,6 +72,12 @@ Specials are season 0 (`s0`).
 ### Movies and series with the same name
 
 A name is looked up among both movies and series. An exact (case-insensitive) title match is preferred, otherwise the first search result is used, and any other matches are listed so you can see what else it found. Use `-t movie` or `-t series` to search only one type.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests
+```
 
 ## License
 
