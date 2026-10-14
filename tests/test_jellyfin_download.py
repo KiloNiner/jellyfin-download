@@ -1,8 +1,10 @@
 import importlib.util
+import io
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parent.parent / "jellyfin-download.py"
 spec = importlib.util.spec_from_file_location("jellyfin_download", SCRIPT)
@@ -119,6 +121,108 @@ class ConfigTests(unittest.TestCase):
         os.environ["JELLYFIN_URL"] = "http://env.example"
         self.load("JELLYFIN_URL=http://file.example\n")
         self.assertEqual(os.environ["JELLYFIN_URL"], "http://env.example")
+
+
+class FakeResponse:
+    """Minimal urlopen() response. `fail` makes read() raise once the data
+    runs out, like a connection reset; otherwise the stream just ends."""
+
+    def __init__(self, body, start, total, fail=False, status=None):
+        self.body, self.fail = io.BytesIO(body), fail
+        self.status = status or (206 if start else 200)
+        self.headers = {"Content-Range": f"bytes {start}-{total - 1}/{total}",
+                        "Content-Disposition": 'attachment; filename="t.bin"'}
+
+    def read(self, n):
+        data = self.body.read(n)
+        if not data and self.fail:
+            raise ConnectionResetError("reset by peer")
+        return data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        pass
+
+
+class FlakyAPI:
+    """Serves `data`; `script` lists one behaviour per full-file request:
+    "503" (transient error), "cut" (stream ends early), "reset" (read raises),
+    or "ok". The 1-byte probe request is always served."""
+
+    def __init__(self, data, script, cut_at=1000):
+        self.data, self.script, self.cut_at = data, list(script), cut_at
+        self.requests = 0
+
+    def request(self, path, params=None, headers=None):
+        rng = (headers or {}).get("Range", "")
+        start = int(rng.split("=")[1].split("-")[0]) if rng else 0
+        if rng == "bytes=0-0":
+            return FakeResponse(self.data[:1], 0, len(self.data), status=206)
+        self.requests += 1
+        action = self.script.pop(0) if self.script else "ok"
+        if action == "503":
+            raise jd.TransientError("503 Service Unavailable")
+        body = self.data[start:]
+        if action in ("cut", "reset"):
+            return FakeResponse(body[:self.cut_at], start, len(self.data), fail=action == "reset")
+        return FakeResponse(body, start, len(self.data))
+
+
+class RetryTests(unittest.TestCase):
+    data = bytes(range(256)) * 20
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        patch = mock.patch.object(jd.time, "sleep")
+        self.sleep = patch.start()
+        self.addCleanup(patch.stop)
+        for stream in ("sys.stdout", "sys.stderr"):
+            patch = mock.patch(stream, io.StringIO())
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def download(self, script, **kw):
+        api = FlakyAPI(self.data, script, **kw)
+        jd.download_file(api, "x", "fallback.bin", self.dir, "[1/1]")
+        return api
+
+    def test_clean_download(self):
+        api = self.download([])
+        self.assertEqual((self.dir / "t.bin").read_bytes(), self.data)
+        self.assertEqual(api.requests, 1)
+
+    def test_resumes_after_truncated_stream(self):
+        api = self.download(["cut", "cut"])
+        self.assertEqual((self.dir / "t.bin").read_bytes(), self.data)
+        self.assertEqual(api.requests, 3)
+
+    def test_resumes_after_connection_reset(self):
+        self.download(["reset"])
+        self.assertEqual((self.dir / "t.bin").read_bytes(), self.data)
+
+    def test_retries_transient_server_error(self):
+        self.download(["503", "ok"])
+        self.assertEqual((self.dir / "t.bin").read_bytes(), self.data)
+        self.sleep.assert_called_once_with(1)
+
+    def test_gives_up_without_progress(self):
+        with self.assertRaises(jd.JellyfinError) as ctx:
+            self.download(["503"] * (jd.MAX_RETRIES + 1))
+        self.assertIn("giving up", str(ctx.exception))
+
+    def test_failure_counter_resets_on_progress(self):
+        # More cuts than MAX_RETRIES, but each one makes progress.
+        self.download(["cut"] * (jd.MAX_RETRIES + 5), cut_at=100)
+        self.assertEqual((self.dir / "t.bin").read_bytes(), self.data)
+
+    def test_backoff_is_capped(self):
+        self.download(["503"] * jd.MAX_RETRIES)
+        delays = [c.args[0] for c in self.sleep.call_args_list]
+        self.assertEqual(delays, [min(2 ** i, jd.MAX_BACKOFF) for i in range(jd.MAX_RETRIES)])
 
 
 if __name__ == "__main__":
