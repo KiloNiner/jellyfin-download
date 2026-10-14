@@ -34,6 +34,7 @@ Complete files are skipped and partial files are resumed.
 """
 
 import argparse
+import http.client
 import json
 import math
 import os
@@ -56,10 +57,36 @@ TYPES = {
     "series": "Series", "show": "Series", "shows": "Series", "tv": "Series",
 }
 CHUNK_SIZE = 1024 * 1024
+TIMEOUT = 60  # seconds without data before a connection counts as stalled
+MAX_RETRIES = 10  # consecutive failures without progress before giving up
+MAX_BACKOFF = 30  # seconds
 
 
 class JellyfinError(Exception):
     pass
+
+
+class TransientError(JellyfinError):
+    """A failure worth retrying: dropped connection, timeout, server 5xx."""
+
+
+def wait_to_retry(failures, error):
+    """Sleeps with exponential backoff, or gives up after MAX_RETRIES in a row."""
+    if failures > MAX_RETRIES:
+        raise JellyfinError(f"{error} (giving up after {MAX_RETRIES} retries)")
+    delay = min(2 ** (failures - 1), MAX_BACKOFF)
+    print(f"  {error}; retrying in {delay}s ({failures}/{MAX_RETRIES})", file=sys.stderr, flush=True)
+    time.sleep(delay)
+
+
+def retry(fn):
+    failures = 0
+    while True:
+        try:
+            return fn()
+        except TransientError as e:
+            failures += 1
+            wait_to_retry(failures, e)
 
 
 # --- Configuration -----------------------------------------------------------
@@ -113,22 +140,33 @@ class Jellyfin:
                      f'Token="{api_key}"')
 
     def request(self, path, params=None, headers=None):
+        """Opens a GET request. Network failures and 5xx/429 responses raise
+        TransientError; callers wrap this in retry() where it is safe to repeat."""
         url = self.url + path
         if params:
             url += "?" + urllib.parse.urlencode(params)
         req = urllib.request.Request(url, headers={"Authorization": self.auth, **(headers or {})})
         try:
-            return urllib.request.urlopen(req, timeout=60)
+            return urllib.request.urlopen(req, timeout=TIMEOUT)
         except urllib.error.HTTPError as e:
             if e.code == 416:
                 return e
+            if e.code >= 500 or e.code == 429:
+                raise TransientError(f"{e.code} {e.reason} from {path}") from None
             raise JellyfinError(f"{e.code} {e.reason} from {path}") from None
         except urllib.error.URLError as e:
-            raise JellyfinError(f"Cannot reach {self.url}: {e.reason}") from None
+            raise TransientError(f"Cannot reach {self.url}: {e.reason}") from None
+        except (OSError, http.client.HTTPException) as e:
+            raise TransientError(f"Connection to {self.url} failed: {e}") from None
 
     def get(self, path, **params):
-        with self.request(path, params) as resp:
-            return json.load(resp)
+        def attempt():
+            with self.request(path, params) as resp:
+                try:
+                    return json.load(resp)
+                except (OSError, http.client.HTTPException, ValueError) as e:
+                    raise TransientError(f"Incomplete response from {path}: {e}") from None
+        return retry(attempt)
 
     def search(self, types, term=None):
         params = {"recursive": "true", "IncludeItemTypes": types,
@@ -274,7 +312,7 @@ class Progress:
         self.enabled = sys.stderr.isatty()
         color = self.enabled and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
         codes = {"star": "2", "tie": "37", "laser": "92", "xwing": "1;97",
-                 "engine": "91", "xlaser": "1;91", "boom": "1;93"}
+                 "engine": "1;97", "xlaser": "1;91", "boom": "1;93"}
         self.style = {k: f"\033[{v}m" if color else "" for k, v in codes.items()}
         self.reset = "\033[0m" if color else ""
 
@@ -357,31 +395,55 @@ def download_file(api, item_id, fallback_name, dest_dir, label):
 
     # Probe headers with a 1-byte ranged request to learn the server's
     # filename and the total size without pulling the whole file twice.
-    with api.request(path, headers={"Range": "bytes=0-0"}) as probe:
-        name = content_disposition_filename(probe.headers.get("Content-Disposition"))
-        size = remote_size(probe)
+    def probe_once():
+        with api.request(path, headers={"Range": "bytes=0-0"}) as probe:
+            return (content_disposition_filename(probe.headers.get("Content-Disposition")),
+                    remote_size(probe))
+    name, size = retry(probe_once)
     filename = sanitize(name) if name else fallback_name
     out_path = dest_dir / filename
 
-    offset = out_path.stat().st_size if out_path.exists() else 0
-    if offset and size is not None:
-        if offset == size:
-            print(f"{label} Skipping (already complete): {filename}")
-            return
-        if offset > size:
-            print(f"{label} Local file larger than remote, re-downloading: {filename}")
-            offset = 0
-    if offset:
-        print(f"{label} Resuming ({human_size(offset)} / {human_size(size or 0)}): {filename}")
-    else:
-        print(f"{label} Downloading: {filename}")
+    def local_size():
+        return out_path.stat().st_size if out_path.exists() else 0
 
+    # Each pass resumes from whatever is on disk, so a dropped connection just
+    # costs a reconnect. Gives up after MAX_RETRIES failures without progress.
+    first, failures = True, 0
+    while True:
+        offset = local_size()
+        if offset and size is not None:
+            if offset == size:
+                print(f"{label} {'Skipping (already complete)' if first else 'Complete'}: {filename}")
+                return
+            if offset > size:
+                print(f"{label} Local file larger than remote, re-downloading: {filename}")
+                offset = 0
+        if first:
+            if offset:
+                print(f"{label} Resuming ({human_size(offset)} / {human_size(size or 0)}): {filename}")
+            else:
+                print(f"{label} Downloading: {filename}")
+            first = False
+
+        try:
+            if stream_to_file(api, path, out_path, offset, size):
+                return
+            error = TransientError(f"Connection closed early at {human_size(local_size())}")
+        except TransientError as e:
+            error = e
+        failures = 1 if local_size() > offset else failures + 1
+        wait_to_retry(failures, error)
+
+
+def stream_to_file(api, path, out_path, offset, size):
+    """Downloads from offset to the end of the file. Returns False if the
+    stream ended before the expected size; raises TransientError on a
+    connection failure."""
     headers = {"Range": f"bytes={offset}-"} if offset else {}
     with api.request(path, headers=headers) as resp:
         if resp.status == 416:
             # Nothing left to fetch: the local file is already complete.
-            print(f"{label} Already complete: {filename}")
-            return
+            return True
         if offset and resp.status != 206:
             # Server ignored the Range header; start over.
             offset = 0
@@ -389,10 +451,22 @@ def download_file(api, item_id, fallback_name, dest_dir, label):
         with open(out_path, "r+b" if offset else "wb") as f:
             f.seek(offset)
             f.truncate()
-            while chunk := resp.read(CHUNK_SIZE):
-                f.write(chunk)
-                progress.update(len(chunk))
+            done = offset
+            try:
+                while chunk := resp.read(CHUNK_SIZE):
+                    f.write(chunk)
+                    done += len(chunk)
+                    progress.update(len(chunk))
+            except (OSError, http.client.HTTPException) as e:
+                if progress.enabled:
+                    print(file=sys.stderr)
+                raise TransientError(f"Download interrupted: {e}") from None
+        if size is not None and done < size:
+            if progress.enabled:
+                print(file=sys.stderr)
+            return False
         progress.finish()
+        return True
 
 
 def download_all(api, files, dest_dir):
